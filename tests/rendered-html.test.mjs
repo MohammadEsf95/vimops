@@ -23,14 +23,18 @@ test("renders the VimOps application shell", async () => {
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape/);
 });
 
-test("ships two cumulative six-mission campaigns", async () => {
+test("ships four cumulative six-mission campaigns", async () => {
   const source = await readFile(new URL("app/missions.ts", root), "utf8");
   assert.equal((source.match(/id: "[^"]+", difficulty: "Beginner"/g) ?? []).length, 6);
   assert.equal((source.match(/id: "[^"]+", difficulty: "Intermediate"/g) ?? []).length, 6);
+  assert.equal((source.match(/id: "[^"]+", difficulty: "Professional"/g) ?? []).length, 6);
+  assert.equal((source.match(/id: "[^"]+", difficulty: "Legend"/g) ?? []).length, 6);
   assert.match(source, /docker-compose\.yml/);
   assert.match(source, /:%s\/a\/b\/g/);
   assert.match(source, /beginner-boss/);
   assert.match(source, /intermediate-boss/);
+  assert.match(source, /professional-boss/);
+  assert.match(source, /legend-boss/);
 });
 
 test("accepts alternate solutions, ignores modifier keys, and keeps missions open", async () => {
