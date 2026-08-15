@@ -6,6 +6,8 @@ Learn practical Vim by repairing simulated production incidents in the browser. 
 
 - **Beginner — First Login:** six missions covering modes, `hjkl`, insertion, line edges, new lines, deletion, undo, redo, and saving.
 - **Intermediate — Deployment Failure:** six missions covering search, word motions, character finds, text objects, operator-motion grammar, visual selection, yank/paste, and substitutions.
+- **Professional — Cascade Failure:** six missions covering repeat, counts, marks, named registers, block indentation, and compound release repairs.
+- **Legend — The Outage:** six missions covering structural matching, global commands, deterministic sorting, advanced cleanup, recovery, and a full-platform final incident.
 - Every later incident reuses earlier techniques. Missions validate both the final file and the intended Vim skills.
 
 Progress is stored locally in the browser. No account or backend is required.

@@ -5,6 +5,7 @@ import { missions } from "./missions";
 
 type Mode = "NORMAL" | "INSERT" | "VISUAL" | "V-LINE" | "COMMAND" | "SEARCH";
 type Snapshot = { text: string; cursor: number };
+type LastEdit = { removed: string; inserted: string };
 
 const clamp = (n: number, min: number, max: number) => Math.max(min, Math.min(max, n));
 const startOfLine = (text: string, at: number) => text.lastIndexOf("\n", Math.max(0, at - 1)) + 1;
@@ -54,10 +55,14 @@ export default function VimGame() {
   const [undo, setUndo] = useState<Snapshot[]>([]);
   const [redo, setRedo] = useState<Snapshot[]>([]);
   const [yank, setYank] = useState("");
+  const [registers, setRegisters] = useState<Record<string, string>>({});
+  const [selectedRegister, setSelectedRegister] = useState("");
+  const [marks, setMarks] = useState<Record<string, number>>({});
+  const [count, setCount] = useState("");
+  const [lastEdit, setLastEdit] = useState<LastEdit | null>(null);
   const [visualAnchor, setVisualAnchor] = useState<number | null>(null);
   const [lastSearch, setLastSearch] = useState("");
   const [completed, setCompleted] = useState<Set<number>>(new Set());
-  const [maxUnlocked, setMaxUnlocked] = useState(0);
   const [showSuccess, setShowSuccess] = useState(false);
   const [hint, setHint] = useState(-1);
   const [keystrokes, setKeystrokes] = useState(0);
@@ -69,7 +74,6 @@ export default function VimGame() {
     if (saved) {
       const parsed = JSON.parse(saved) as number[];
       setCompleted(new Set(parsed));
-      setMaxUnlocked(Math.min(missions.length - 1, parsed.length));
     }
   }, []);
 
@@ -88,7 +92,21 @@ export default function VimGame() {
   function mark(name: string) { setUsed((current) => new Set(current).add(name)); }
   function snapshot() { setUndo((items) => [...items, { text, cursor }].slice(-80)); setRedo([]); }
   function replace(from: number, to: number, value: string, next = from + value.length) {
-    snapshot(); setText(text.slice(0, from) + value + text.slice(to)); setCursor(next);
+    snapshot(); setLastEdit({ removed: text.slice(from, to), inserted: value }); setText(text.slice(0, from) + value + text.slice(to)); setCursor(next);
+  }
+  function rememberInsertEdit() {
+    const before = undo.at(-1)?.text;
+    if (before === undefined || before === text) return;
+    let start = 0;
+    while (start < before.length && start < text.length && before[start] === text[start]) start += 1;
+    let oldEnd = before.length; let newEnd = text.length;
+    while (oldEnd > start && newEnd > start && before[oldEnd - 1] === text[newEnd - 1]) { oldEnd -= 1; newEnd -= 1; }
+    setLastEdit({ removed: before.slice(start, oldEnd), inserted: text.slice(start, newEnd) });
+  }
+  function storeYank(value: string) {
+    setYank(value);
+    if (selectedRegister) setRegisters((items) => ({ ...items, [selectedRegister]: value }));
+    setSelectedRegister("");
   }
   function enterInsert(at = cursor, source = "insert") {
     snapshot(); setCursor(clamp(at, 0, text.length)); setMode("INSERT"); setPending(""); mark(source); setMessage("INSERT mode — Esc returns to NORMAL");
@@ -115,9 +133,10 @@ export default function VimGame() {
     setUndo((items) => [...items, { text, cursor }]); setRedo((items) => items.slice(0, -1));
     setText(next.text); setCursor(next.cursor); mark("redo"); setMessage("Change restored");
   }
-  function deleteLine(change = false) {
-    const from = startOfLine(text, cursor); let to = endOfLine(text, cursor);
-    if (to < text.length) to += 1; else if (from > 0) { replace(from - 1, to, "", from - 1); mark("dd"); return; }
+  function deleteLine(change = false, amount = 1) {
+    const from = startOfLine(text, cursor); let to = from;
+    for (let i = 0; i < amount; i += 1) { to = endOfLine(text, to); if (to < text.length) to += 1; }
+    if (to === text.length && from > 0 && amount === 1) { replace(from - 1, to, "", from - 1); mark("dd"); return; }
     replace(from, to, "", Math.min(from, Math.max(0, text.length - (to - from)))); mark("dd"); if (change) setMode("INSERT");
   }
   function applyTextObject(operator: string, delimiter: string) {
@@ -125,7 +144,7 @@ export default function VimGame() {
     if (text[cursor] === delimiter) { left = cursor; right = text.indexOf(delimiter, cursor + 1); }
     if (left < 0 || right < 0) { setPending(""); setMessage(`No ${delimiter} pair found`); return; }
     const content = text.slice(left + 1, right);
-    if (operator === "y") { setYank(content); mark("yank"); setCursor(left + 1); }
+    if (operator === "y") { storeYank(content); mark("yank"); setCursor(left + 1); }
     else { replace(left + 1, right, "", left + 1); if (operator === "c") setMode("INSERT"); mark("text-object"); }
     setPending("");
   }
@@ -135,25 +154,56 @@ export default function VimGame() {
     const wrapped = index >= 0 ? index : backwards ? text.lastIndexOf(term) : text.indexOf(term);
     if (wrapped >= 0) { setCursor(wrapped); setMessage(`Found ${term}`); } else setMessage(`Pattern not found: ${term}`);
   }
-  function validateSave(nextUsed: Set<string>) {
+  function jumpToMatch() {
+    const pairs: Record<string, string> = { "(": ")", "[": "]", "{": "}", ")": "(", "]": "[", "}": "{" };
+    let at = cursor;
+    if (!pairs[text[at]]) {
+      const lineEnd = endOfLine(text, cursor);
+      while (at < lineEnd && !pairs[text[at]]) at += 1;
+    }
+    const source = text[at]; const target = pairs[source];
+    if (!target) { setMessage("No matching bracket on this line"); return; }
+    const direction = "([{".includes(source) ? 1 : -1; let depth = 0;
+    for (let i = at; i >= 0 && i < text.length; i += direction) {
+      if (text[i] === source) depth += 1;
+      if (text[i] === target) depth -= 1;
+      if (depth === 0) { setCursor(i); mark("match-pair"); return; }
+    }
+    setMessage(`No match for ${source}`);
+  }
+  function indentLines(direction: 1 | -1, amount = 1) {
+    const from = startOfLine(text, cursor); let to = from;
+    for (let i = 0; i < amount; i += 1) { to = endOfLine(text, to); if (to < text.length) to += 1; }
+    const block = text.slice(from, to);
+    const trailingNewline = block.endsWith("\n");
+    const lines = (trailingNewline ? block.slice(0, -1) : block).split("\n");
+    const changed = lines.map((line) => direction > 0 ? `  ${line}` : line.replace(/^ {1,2}/, "")).join("\n") + (trailingNewline ? "\n" : "");
+    replace(from, to, changed, from); mark("indent");
+  }
+  function validateSave() {
     const clean = (value: string) => value.replace(/\r/g, "").trimEnd();
     if (clean(text) !== clean(mission.target)) { setMessage("Saved — the incident is not fully repaired yet"); return; }
-    const stillMissing = mission.required.filter((item) => !nextUsed.has(item));
-    if (stillMissing.length) { setMessage(`File is correct. Complete the drill with: ${stillMissing.join(", ")}`); return; }
     const nextCompleted = new Set(completed).add(missionIndex); setCompleted(nextCompleted);
-    setMaxUnlocked(Math.max(maxUnlocked, Math.min(missions.length - 1, missionIndex + 1)));
     localStorage.setItem("vimops-progress", JSON.stringify([...nextCompleted].sort((a, b) => a - b))); setShowSuccess(true);
   }
   function executeCommand(value: string) {
     setMode("NORMAL"); setCommand(""); setPending("");
     if (value === "w" || value === "wq") {
-      const nextUsed = new Set(used).add("save"); setUsed(nextUsed); setMessage(`"${mission.file}" written`); validateSave(nextUsed); return;
+      const nextUsed = new Set(used).add("save"); setUsed(nextUsed); setMessage(`"${mission.file}" written`); validateSave(); return;
     }
     const substitution = value.match(/^%s\/(.*?)\/(.*?)\/(g)?$/);
     if (substitution) {
       const [, before, after, global] = substitution; if (!before) return setMessage("Empty search pattern");
       snapshot(); setText(global ? text.split(before).join(after) : text.replace(before, after)); mark("substitute"); setMessage(`Replaced ${global ? "all" : "first"} “${before}”`); return;
     }
+    const globalDelete = value.match(/^([gv])\/(.*?)\/d$/);
+    if (globalDelete) {
+      const [, kind, pattern] = globalDelete;
+      snapshot();
+      setText(text.split("\n").filter((line) => kind === "g" ? !line.includes(pattern) : line.includes(pattern)).join("\n"));
+      setCursor(0); mark("global"); setMessage(`Deleted lines ${kind === "g" ? "matching" : "not matching"} “${pattern}”`); return;
+    }
+    if (value === "sort") { snapshot(); setText([...text.split("\n")].sort().join("\n")); setCursor(0); mark("sort"); setMessage("Lines sorted"); return; }
     if (value === "q" || value === "q!") { setMessage("No quitting during an incident. Finish the mission."); return; }
     setMessage(`Not an available training command: :${value}`);
   }
@@ -173,12 +223,19 @@ export default function VimGame() {
     else if (key === "j") moveVertical(1); else if (key === "k") moveVertical(-1);
     else if (["y", "d", "c"].includes(key)) {
       const [from, to] = visualRange(); const selected = text.slice(from, to);
-      if (key === "y") { setYank(selected); setCursor(from); mark("yank"); }
+      if (key === "y") { storeYank(selected); setCursor(from); mark("yank"); }
       else { replace(from, to, "", from); if (key === "c") setMode("INSERT"); }
       setMode(key === "c" ? "INSERT" : "NORMAL"); setVisualAnchor(null); mark("visual");
     }
   }
   function handlePending(key: string) {
+    // Browsers emit modifier keys as separate keydown events. Vim is still
+    // waiting for the actual one-character target after Shift/Ctrl/etc.
+    if (key.length !== 1) return true;
+    if (pending === "\"") { setSelectedRegister(key); setPending(""); mark("register"); return true; }
+    if (pending === "m") { setMarks((items) => ({ ...items, [key]: cursor })); setPending(""); mark("mark"); setMessage(`Mark ${key} set`); return true; }
+    if (pending === "'") { const target = marks[key]; if (target !== undefined) { setCursor(startOfLine(text, target)); mark("mark"); } else setMessage(`Mark ${key} is not set`); setPending(""); return true; }
+    if ((pending === ">" || pending === "<") && key === pending) { indentLines(key === ">" ? 1 : -1, Number(count) || 1); setCount(""); setPending(""); return true; }
     if (["f", "t", "F", "T"].includes(pending)) {
       const from = pending === "F" || pending === "T" ? startOfLine(text, cursor) : cursor + 1;
       const segment = pending === "F" || pending === "T" ? text.slice(from, cursor) : text.slice(from, endOfLine(text, cursor));
@@ -190,61 +247,70 @@ export default function VimGame() {
     if (["ci", "di", "yi"].includes(pending)) { applyTextObject(pending[0], key); return true; }
     if (["c", "d", "y"].includes(pending) && key === "i") { setPending(pending + "i"); return true; }
     if (["c", "d", "y"].includes(pending) && key === pending) {
-      if (key === "d" || key === "c") deleteLine(key === "c");
-      else { const from = startOfLine(text, cursor); const to = Math.min(text.length, endOfLine(text, cursor) + 1); setYank(text.slice(from, to)); mark("yank"); }
-      setPending(""); return true;
+      if (key === "d" || key === "c") deleteLine(key === "c", Number(count) || 1);
+      else { const from = startOfLine(text, cursor); let to = from; for (let i = 0; i < (Number(count) || 1); i += 1) { to = endOfLine(text, to); if (to < text.length) to += 1; } storeYank(text.slice(from, to)); mark("yank"); }
+      setCount(""); setPending(""); return true;
     }
     if (["c", "d", "y"].includes(pending) && ["w", "e", "$"].includes(key)) {
       const to = key === "$" ? endOfLine(text, cursor) : pending === "c" && key === "w" ? wordEnd(text, cursor) + 1 : nextWord(text, cursor); const value = text.slice(cursor, to);
-      if (pending === "y") { setYank(value); mark("yank"); } else { replace(cursor, to, "", cursor); if (pending === "c") setMode("INSERT"); mark("operator-motion"); }
-      setPending(""); return true;
+      if (pending === "y") { storeYank(value); mark("yank"); } else { replace(cursor, to, "", cursor); if (pending === "c") setMode("INSERT"); mark("operator-motion"); }
+      setCount(""); setPending(""); return true;
     }
     setPending(""); return false;
   }
   function handleNormal(event: React.KeyboardEvent<HTMLTextAreaElement>) {
     event.preventDefault(); const key = event.key;
+    if (/^[0-9]$/.test(key) && (key !== "0" || count)) { setCount((value) => value + key); return; }
     if (pending && handlePending(key)) return;
-    if (key === "h") { setCursor(Math.max(0, cursor - 1)); mark("navigate"); }
-    else if (key === "l") { setCursor(Math.min(text.length, cursor + 1)); mark("navigate"); }
-    else if (key === "j") moveVertical(1); else if (key === "k") moveVertical(-1);
+    const times = Number(count) || 1;
+    if (key === "h") { setCursor(Math.max(0, cursor - times)); mark("navigate"); }
+    else if (key === "l") { setCursor(Math.min(text.length, cursor + times)); mark("navigate"); }
+    else if (key === "j") moveVertical(times); else if (key === "k") moveVertical(-times);
     else if (key === "0") { setCursor(startOfLine(text, cursor)); mark("line-edge"); }
     else if (key === "^") { setCursor(firstNonBlank(text, cursor)); mark("line-edge"); }
     else if (key === "$") { setCursor(endOfLine(text, cursor)); mark("line-edge"); }
-    else if (key === "w") { setCursor(nextWord(text, cursor)); mark("word-motion"); }
-    else if (key === "b") { setCursor(previousWord(text, cursor)); mark("word-motion"); }
+    else if (key === "w") { let next = cursor; for (let i = 0; i < times; i += 1) next = nextWord(text, next); setCursor(next); mark("word-motion"); }
+    else if (key === "b") { let next = cursor; for (let i = 0; i < times; i += 1) next = previousWord(text, next); setCursor(next); mark("word-motion"); }
     else if (key === "e") { setCursor(wordEnd(text, cursor)); mark("word-motion"); }
     else if (key === "G") { setCursor(text.length); mark("file-motion"); } else if (key === "g") setPending("g");
-    else if (["f", "t", "F", "T"].includes(key)) setPending(key); else if (["d", "c", "y"].includes(key)) setPending(key);
+    else if (["f", "t", "F", "T"].includes(key)) setPending(key); else if (["d", "c", "y", ">", "<"].includes(key)) setPending(key);
+    else if (key === "m" || key === "'" || key === "\"") setPending(key);
     else if (key === "i") enterInsert(cursor, "insert"); else if (key === "a") enterInsert(Math.min(text.length, cursor + 1), "append");
     else if (key === "A") { mark("line-edge"); enterInsert(endOfLine(text, cursor), "append"); }
     else if (key === "I") { mark("line-edge"); enterInsert(firstNonBlank(text, cursor), "insert"); }
     else if (key === "o" || key === "O") {
       const at = key === "o" ? endOfLine(text, cursor) : startOfLine(text, cursor); replace(at, at, "\n", key === "o" ? at + 1 : at); setMode("INSERT"); mark("open-line");
     }
-    else if (key === "x") { if (cursor < text.length && text[cursor] !== "\n") replace(cursor, cursor + 1, "", cursor); mark("x"); }
+    else if (key === "x") { if (cursor < text.length && text[cursor] !== "\n") replace(cursor, Math.min(endOfLine(text, cursor), cursor + times), "", cursor); mark("x"); }
+    else if (key === ".") { if (lastEdit) { replace(cursor, cursor + lastEdit.removed.length, lastEdit.inserted, cursor + lastEdit.inserted.length); mark("repeat"); } else setMessage("No previous change to repeat"); }
+    else if (key === "%") jumpToMatch();
     else if (key === "u") doUndo(); else if (event.ctrlKey && key.toLowerCase() === "r") doRedo();
     else if (key === "p" || key === "P") {
-      if (!yank) { setMessage("Nothing in the yank register yet"); return; }
+      const pasteValue = selectedRegister ? registers[selectedRegister] ?? "" : yank;
+      if (!pasteValue) { setMessage("Nothing in that register yet"); return; }
       let at = key === "P" ? startOfLine(text, cursor) : cursor + 1;
-      if (yank.endsWith("\n")) at = key === "P" ? startOfLine(text, cursor) : Math.min(text.length, endOfLine(text, cursor) + 1);
-      replace(at, at, yank, at); mark("paste");
+      if (pasteValue.endsWith("\n")) at = key === "P" ? startOfLine(text, cursor) : Math.min(text.length, endOfLine(text, cursor) + 1);
+      replace(at, at, pasteValue, at); setSelectedRegister(""); mark("paste");
     }
     else if (key === "v" || key === "V") { setVisualAnchor(cursor); setMode(key === "V" ? "V-LINE" : "VISUAL"); mark("visual"); }
     else if (key === ":") { setMode("COMMAND"); setCommand(""); }
     else if (key === "/" || key === "?") { setMode("SEARCH"); setCommand(""); mark("search"); }
     else if (key === "n" || key === "N") { search(lastSearch, key === "N"); mark("search"); }
+    if (!["d", "c", "y", ">", "<", "m", "'", "\"", "f", "t", "F", "T", "g"].includes(key)) setCount("");
   }
   function onKeyDown(event: React.KeyboardEvent<HTMLTextAreaElement>) {
+    if (showSuccess) { event.preventDefault(); return; }
+    if (["Shift", "Control", "Alt", "Meta"].includes(event.key)) return;
     setKeystrokes((value) => value + 1);
     if (mode === "COMMAND" || mode === "SEARCH") { handleCommandKey(event); return; }
     if (mode === "VISUAL" || mode === "V-LINE") { event.preventDefault(); handleVisual(event.key); return; }
-    if (mode === "INSERT") { if (event.key === "Escape") { event.preventDefault(); setMode("NORMAL"); mark("escape"); setMessage("NORMAL mode"); } return; }
+    if (mode === "INSERT") { if (event.key === "Escape") { event.preventDefault(); rememberInsertEdit(); setMode("NORMAL"); mark("escape"); setMessage("NORMAL mode"); } return; }
     handleNormal(event);
   }
   function selectMission(index: number) {
-    if (index > maxUnlocked) return; const next = missions[index];
+    const next = missions[index];
     setMissionIndex(index); setText(next.initial); setCursor(0); setMode("NORMAL"); setPending(""); setCommand(""); setUsed(new Set());
-    setUndo([]); setRedo([]); setYank(""); setHint(-1); setKeystrokes(0); setShowSuccess(false); setShowMissions(false); setMessage("NORMAL mode — use the mission keys to begin");
+    setUndo([]); setRedo([]); setYank(""); setRegisters({}); setSelectedRegister(""); setMarks({}); setCount(""); setLastEdit(null); setHint(-1); setKeystrokes(0); setShowSuccess(false); setShowMissions(false); setMessage("NORMAL mode — use the mission keys to begin");
     setTimeout(() => editor.current?.focus(), 0);
   }
   const lineCount = text.split("\n").length; const { row, col } = rowColumn(text, cursor); const score = Math.max(100, 1000 - keystrokes - Math.max(0, hint + 1) * 100);
@@ -257,9 +323,9 @@ export default function VimGame() {
     </header>
     <div className={`mission-drawer ${showMissions ? "open" : ""}`}>
       <div className="drawer-head"><span>SHIFT MAP</span><button onClick={() => setShowMissions(false)}>×</button></div>
-      {(["Beginner", "Intermediate"] as const).map((difficulty) => <section key={difficulty}><h2>{difficulty}</h2>
-        {missions.map((item, index) => item.difficulty === difficulty && <button key={item.id} disabled={index > maxUnlocked} className={index === missionIndex ? "active" : ""} onClick={() => selectMission(index)}>
-          <span>{completed.has(index) ? "✓" : index > maxUnlocked ? "·" : String(index + 1).padStart(2, "0")}</span><div><strong>{item.chapter}</strong><small>{item.title}</small></div>
+      {(["Beginner", "Intermediate", "Professional", "Legend"] as const).map((difficulty) => <section key={difficulty}><h2>{difficulty}</h2>
+        {missions.map((item, index) => item.difficulty === difficulty && <button key={item.id} className={index === missionIndex ? "active" : ""} onClick={() => selectMission(index)}>
+          <span>{completed.has(index) ? "✓" : String(index + 1).padStart(2, "0")}</span><div><strong>{item.chapter}</strong><small>{item.title}</small></div>
         </button>)}
       </section>)}
     </div>
@@ -270,15 +336,15 @@ export default function VimGame() {
         <div className="keys">{mission.commands.map((item) => <div key={item.keys}><kbd>{item.keys}</kbd><span>{item.label}</span></div>)}</div>
         <div className="actions"><button onClick={() => { setHint(Math.min(mission.hints.length - 1, hint + 1)); editor.current?.focus(); }}>REQUEST HINT</button><button onClick={() => selectMission(missionIndex)}>RESET FILE</button></div>
         {hint >= 0 && <p className="hint"><span>HINT {hint + 1}/{mission.hints.length}</span>{mission.hints[hint]}</p>}
-        <p className="tip">Mission map: click <strong>VIMOPS</strong>. Progress is saved on this device.</p>
+        <p className="tip">Mission map: click <strong>VIMOPS</strong>. Every mission is open; progress is saved on this device.</p>
       </aside>
       <section className="terminal" aria-label="Vim training editor">
         <div className="terminal-title"><span>deploy@incident</span><span>{mission.file}</span></div>
         <div className="editor-wrap"><div className="gutter">{Array.from({ length: lineCount }, (_, i) => <span className={i === row ? "current" : ""} key={i}>{i + 1}</span>)}</div>
           <textarea ref={editor} value={text} onChange={(event) => { if (mode === "INSERT") { setText(event.target.value); setCursor(event.target.selectionStart); } }} onKeyDown={onKeyDown} onClick={(event) => { setCursor(event.currentTarget.selectionStart); event.currentTarget.focus(); }} spellCheck={false} aria-label={`${mission.file} editor`} autoCapitalize="off" autoCorrect="off" />
         </div>
-        <div className="commandline">{mode === "COMMAND" ? `:${command}` : mode === "SEARCH" ? `/${command}` : pending || message}</div>
-        <div className="statusline"><strong className={`mode-${mode.toLowerCase()}`}>-- {mode} --</strong><span>{missing.length ? `${mission.required.length - missing.length}/${mission.required.length} drill skills used` : "all drill skills used"}</span><span>{row + 1}:{col + 1} · {keystrokes} keys</span></div>
+        <div className="commandline">{mode === "COMMAND" ? `:${command}` : mode === "SEARCH" ? `/${command}` : `${count}${pending}` || message}</div>
+        <div className="statusline"><strong className={`mode-${mode.toLowerCase()}`}>-- {mode} --</strong><span>{missing.length ? `${mission.required.length - missing.length}/${mission.required.length} suggested skills practiced` : "all suggested skills practiced"}</span><span>{row + 1}:{col + 1} · {keystrokes} keys</span></div>
       </section>
     </section>
     {showSuccess && <div className="success-backdrop" role="dialog" aria-modal="true" aria-label="Mission complete"><div className="success-card">
