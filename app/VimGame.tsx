@@ -57,7 +57,6 @@ export default function VimGame() {
   const [visualAnchor, setVisualAnchor] = useState<number | null>(null);
   const [lastSearch, setLastSearch] = useState("");
   const [completed, setCompleted] = useState<Set<number>>(new Set());
-  const [maxUnlocked, setMaxUnlocked] = useState(0);
   const [showSuccess, setShowSuccess] = useState(false);
   const [hint, setHint] = useState(-1);
   const [keystrokes, setKeystrokes] = useState(0);
@@ -69,7 +68,6 @@ export default function VimGame() {
     if (saved) {
       const parsed = JSON.parse(saved) as number[];
       setCompleted(new Set(parsed));
-      setMaxUnlocked(Math.min(missions.length - 1, parsed.length));
     }
   }, []);
 
@@ -135,19 +133,16 @@ export default function VimGame() {
     const wrapped = index >= 0 ? index : backwards ? text.lastIndexOf(term) : text.indexOf(term);
     if (wrapped >= 0) { setCursor(wrapped); setMessage(`Found ${term}`); } else setMessage(`Pattern not found: ${term}`);
   }
-  function validateSave(nextUsed: Set<string>) {
+  function validateSave() {
     const clean = (value: string) => value.replace(/\r/g, "").trimEnd();
     if (clean(text) !== clean(mission.target)) { setMessage("Saved — the incident is not fully repaired yet"); return; }
-    const stillMissing = mission.required.filter((item) => !nextUsed.has(item));
-    if (stillMissing.length) { setMessage(`File is correct. Complete the drill with: ${stillMissing.join(", ")}`); return; }
     const nextCompleted = new Set(completed).add(missionIndex); setCompleted(nextCompleted);
-    setMaxUnlocked(Math.max(maxUnlocked, Math.min(missions.length - 1, missionIndex + 1)));
     localStorage.setItem("vimops-progress", JSON.stringify([...nextCompleted].sort((a, b) => a - b))); setShowSuccess(true);
   }
   function executeCommand(value: string) {
     setMode("NORMAL"); setCommand(""); setPending("");
     if (value === "w" || value === "wq") {
-      const nextUsed = new Set(used).add("save"); setUsed(nextUsed); setMessage(`"${mission.file}" written`); validateSave(nextUsed); return;
+      const nextUsed = new Set(used).add("save"); setUsed(nextUsed); setMessage(`"${mission.file}" written`); validateSave(); return;
     }
     const substitution = value.match(/^%s\/(.*?)\/(.*?)\/(g)?$/);
     if (substitution) {
@@ -179,6 +174,9 @@ export default function VimGame() {
     }
   }
   function handlePending(key: string) {
+    // Browsers emit modifier keys as separate keydown events. Vim is still
+    // waiting for the actual one-character target after Shift/Ctrl/etc.
+    if (key.length !== 1) return true;
     if (["f", "t", "F", "T"].includes(pending)) {
       const from = pending === "F" || pending === "T" ? startOfLine(text, cursor) : cursor + 1;
       const segment = pending === "F" || pending === "T" ? text.slice(from, cursor) : text.slice(from, endOfLine(text, cursor));
@@ -235,6 +233,8 @@ export default function VimGame() {
     else if (key === "n" || key === "N") { search(lastSearch, key === "N"); mark("search"); }
   }
   function onKeyDown(event: React.KeyboardEvent<HTMLTextAreaElement>) {
+    if (showSuccess) { event.preventDefault(); return; }
+    if (["Shift", "Control", "Alt", "Meta"].includes(event.key)) return;
     setKeystrokes((value) => value + 1);
     if (mode === "COMMAND" || mode === "SEARCH") { handleCommandKey(event); return; }
     if (mode === "VISUAL" || mode === "V-LINE") { event.preventDefault(); handleVisual(event.key); return; }
@@ -242,7 +242,7 @@ export default function VimGame() {
     handleNormal(event);
   }
   function selectMission(index: number) {
-    if (index > maxUnlocked) return; const next = missions[index];
+    const next = missions[index];
     setMissionIndex(index); setText(next.initial); setCursor(0); setMode("NORMAL"); setPending(""); setCommand(""); setUsed(new Set());
     setUndo([]); setRedo([]); setYank(""); setHint(-1); setKeystrokes(0); setShowSuccess(false); setShowMissions(false); setMessage("NORMAL mode — use the mission keys to begin");
     setTimeout(() => editor.current?.focus(), 0);
@@ -258,8 +258,8 @@ export default function VimGame() {
     <div className={`mission-drawer ${showMissions ? "open" : ""}`}>
       <div className="drawer-head"><span>SHIFT MAP</span><button onClick={() => setShowMissions(false)}>×</button></div>
       {(["Beginner", "Intermediate"] as const).map((difficulty) => <section key={difficulty}><h2>{difficulty}</h2>
-        {missions.map((item, index) => item.difficulty === difficulty && <button key={item.id} disabled={index > maxUnlocked} className={index === missionIndex ? "active" : ""} onClick={() => selectMission(index)}>
-          <span>{completed.has(index) ? "✓" : index > maxUnlocked ? "·" : String(index + 1).padStart(2, "0")}</span><div><strong>{item.chapter}</strong><small>{item.title}</small></div>
+        {missions.map((item, index) => item.difficulty === difficulty && <button key={item.id} className={index === missionIndex ? "active" : ""} onClick={() => selectMission(index)}>
+          <span>{completed.has(index) ? "✓" : String(index + 1).padStart(2, "0")}</span><div><strong>{item.chapter}</strong><small>{item.title}</small></div>
         </button>)}
       </section>)}
     </div>
@@ -270,7 +270,7 @@ export default function VimGame() {
         <div className="keys">{mission.commands.map((item) => <div key={item.keys}><kbd>{item.keys}</kbd><span>{item.label}</span></div>)}</div>
         <div className="actions"><button onClick={() => { setHint(Math.min(mission.hints.length - 1, hint + 1)); editor.current?.focus(); }}>REQUEST HINT</button><button onClick={() => selectMission(missionIndex)}>RESET FILE</button></div>
         {hint >= 0 && <p className="hint"><span>HINT {hint + 1}/{mission.hints.length}</span>{mission.hints[hint]}</p>}
-        <p className="tip">Mission map: click <strong>VIMOPS</strong>. Progress is saved on this device.</p>
+        <p className="tip">Mission map: click <strong>VIMOPS</strong>. Every mission is open; progress is saved on this device.</p>
       </aside>
       <section className="terminal" aria-label="Vim training editor">
         <div className="terminal-title"><span>deploy@incident</span><span>{mission.file}</span></div>
@@ -278,7 +278,7 @@ export default function VimGame() {
           <textarea ref={editor} value={text} onChange={(event) => { if (mode === "INSERT") { setText(event.target.value); setCursor(event.target.selectionStart); } }} onKeyDown={onKeyDown} onClick={(event) => { setCursor(event.currentTarget.selectionStart); event.currentTarget.focus(); }} spellCheck={false} aria-label={`${mission.file} editor`} autoCapitalize="off" autoCorrect="off" />
         </div>
         <div className="commandline">{mode === "COMMAND" ? `:${command}` : mode === "SEARCH" ? `/${command}` : pending || message}</div>
-        <div className="statusline"><strong className={`mode-${mode.toLowerCase()}`}>-- {mode} --</strong><span>{missing.length ? `${mission.required.length - missing.length}/${mission.required.length} drill skills used` : "all drill skills used"}</span><span>{row + 1}:{col + 1} · {keystrokes} keys</span></div>
+        <div className="statusline"><strong className={`mode-${mode.toLowerCase()}`}>-- {mode} --</strong><span>{missing.length ? `${mission.required.length - missing.length}/${mission.required.length} suggested skills practiced` : "all suggested skills practiced"}</span><span>{row + 1}:{col + 1} · {keystrokes} keys</span></div>
       </section>
     </section>
     {showSuccess && <div className="success-backdrop" role="dialog" aria-modal="true" aria-label="Mission complete"><div className="success-card">

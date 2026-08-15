@@ -32,3 +32,13 @@ test("ships two cumulative six-mission campaigns", async () => {
   assert.match(source, /beginner-boss/);
   assert.match(source, /intermediate-boss/);
 });
+
+test("accepts alternate solutions, ignores modifier keys, and keeps missions open", async () => {
+  const source = await readFile(new URL("app/VimGame.tsx", root), "utf8");
+  assert.doesNotMatch(source, /Complete the drill with/);
+  assert.match(source, /\["Shift", "Control", "Alt", "Meta"\]\.includes\(event\.key\)/);
+  assert.match(source, /if \(key\.length !== 1\) return true/);
+  assert.match(source, /if \(showSuccess\) \{ event\.preventDefault\(\); return; \}/);
+  assert.doesNotMatch(source, /disabled=\{index > maxUnlocked\}/);
+  assert.doesNotMatch(source, /if \(index > maxUnlocked\) return/);
+});
